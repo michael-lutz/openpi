@@ -1,7 +1,8 @@
-from collections.abc import Iterator, Sequence
+import math
 import multiprocessing
 import os
 import typing
+from collections.abc import Iterator, Sequence
 from typing import Protocol, SupportsIndex, TypeVar
 
 import jax
@@ -180,10 +181,72 @@ def create_data_loader(
     return DataLoaderImpl(data_config, data_loader)
 
 
-class TorchDataLoader:
+class NaiveDistributedSampler(torch.utils.data.Sampler):
+    """Naive sampler that only samples from a subset of the dataset for a given JAX process.
+
+    NOTE: this assumes the dataset is fully accessible to all processes.
+
+    Attributes:
+        dataset: The dataset to sample from.
+        num_replicas: The number of replicas to sample from.
+        rank: The rank of the current process.
+        shuffle: Whether to shuffle the dataset.
+        seed: The seed to use for shuffling.
+    """
     def __init__(
         self,
-        dataset,
+        dataset: Dataset,
+        num_replicas: int | None = None,
+        rank: int | None = None,
+        shuffle: bool = True,
+        seed: int = 0,
+    ) -> None:
+        """Initialize the sampler.
+
+        Args:
+            dataset: The dataset to sample from.
+            num_replicas: The number of replicas to sample from.
+            rank: The rank of the current process.
+            shuffle: Whether to shuffle the dataset.
+            seed: The seed to use for shuffling.
+        """
+        if num_replicas is None:
+            num_replicas = jax.process_count()
+        if rank is None:
+            rank = jax.process_index()
+        self.dataset = dataset
+        self.num_replicas = num_replicas
+        self.rank = rank
+        self.shuffle = shuffle
+        self.seed = seed
+        self.num_samples = int(math.floor(len(self.dataset) / self.num_replicas))
+        self.total_size = self.num_samples * self.num_replicas
+
+    def __iter__(self) -> Iterator[int]:
+        """Iterate over the dataset."""
+        indices = list(range(len(self.dataset)))
+        if self.shuffle:
+            g = torch.Generator()
+            g.manual_seed(self.seed)
+            indices = torch.randperm(len(self.dataset), generator=g).tolist()
+        indices = indices[:self.total_size]
+        indices = indices[self.rank:self.total_size:self.num_replicas]
+        return iter(indices)
+
+    def __len__(self) -> int:
+        """Return the number of samples in the dataset."""
+        return self.num_samples
+
+
+class TorchDataLoader:
+    """A PyTorch data loader that supports distributed training.
+    
+    Attributes:
+        torch_loader: The PyTorch data loader.
+    """
+    def __init__(
+        self,
+        dataset: Dataset,
         local_batch_size: int,
         *,
         sharding: jax.sharding.Sharding | None = None,
@@ -207,8 +270,7 @@ class TorchDataLoader:
                 execute in the main process.
             seed: The seed to use for shuffling the data.
         """
-        if jax.process_count() > 1:
-            raise NotImplementedError("Data loading with multiple processes is not supported.")
+        self._num_batches = num_batches
 
         if len(dataset) < local_batch_size:
             raise ValueError(f"Local batch size ({local_batch_size}) is larger than the dataset size ({len(dataset)}).")
@@ -216,26 +278,39 @@ class TorchDataLoader:
         if sharding is None:
             sharding = jax.sharding.SingleDeviceSharding(jax.devices()[0])
         self._sharding = sharding
-        self._num_batches = num_batches
 
         mp_context = None
         if num_workers > 0:
             mp_context = multiprocessing.get_context("spawn")
 
-        generator = torch.Generator()
-        generator.manual_seed(seed)
-        self._data_loader = torch.utils.data.DataLoader(
-            typing.cast(torch.utils.data.Dataset, dataset),
-            batch_size=local_batch_size,
-            shuffle=shuffle,
-            num_workers=num_workers,
-            multiprocessing_context=mp_context,
-            persistent_workers=num_workers > 0,
-            collate_fn=_collate_fn,
-            worker_init_fn=_worker_init_fn,
-            drop_last=True,
-            generator=generator,
-        )
+        if jax.process_count() > 1:
+            sampler = NaiveDistributedSampler(dataset, shuffle=shuffle, seed=seed)
+            self._data_loader = torch.utils.data.DataLoader(
+                typing.cast(torch.utils.data.Dataset, dataset),
+                batch_size=local_batch_size,
+                sampler=sampler,
+                num_workers=num_workers,
+                multiprocessing_context=mp_context,
+                persistent_workers=num_workers > 0,
+                collate_fn=_collate_fn,
+                worker_init_fn=_worker_init_fn,
+                drop_last=True,
+            )
+        else:
+            generator = torch.Generator()
+            generator.manual_seed(seed)
+            self._data_loader = torch.utils.data.DataLoader(
+                typing.cast(torch.utils.data.Dataset, dataset),
+                batch_size=local_batch_size,
+                shuffle=shuffle,
+                num_workers=num_workers,
+                multiprocessing_context=mp_context,
+                persistent_workers=num_workers > 0,
+                collate_fn=_collate_fn,
+                worker_init_fn=_worker_init_fn,
+                drop_last=True,
+                generator=generator,
+            )
 
     @property
     def torch_loader(self) -> torch.utils.data.DataLoader:
